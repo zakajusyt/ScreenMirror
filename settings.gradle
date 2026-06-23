@@ -1,0 +1,159 @@
+package com.example.screenmirror
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Rect
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.IBinder
+import android.util.DisplayMetrics
+import androidx.core.app.NotificationCompat
+
+class ScreenCaptureService : Service() {
+
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var imageReader: ImageReader? = null
+
+    private var captureWidth = 0
+    private var captureHeight = 0
+
+    companion object {
+        const val CHANNEL_ID = "screen_mirror_channel"
+        const val NOTIFICATION_ID = 1
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        startForeground(NOTIFICATION_ID, buildNotification())
+
+        if (intent == null) return START_NOT_STICKY
+
+        val resultCode = intent.getIntExtra("resultCode", -1)
+        val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra("data", Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra("data")
+        }
+
+        if (data == null || resultCode == -1) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        val projectionManager =
+            getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjection = projectionManager.getMediaProjection(resultCode, data)
+
+        // Use the device's full display metrics as the capture buffer size.
+        // When the user picks "Share one app," Android letterboxes that
+        // app's actual content within a buffer of this size — we don't
+        // need to guess crop dimensions ourselves.
+        val metrics = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        windowManager().defaultDisplay.getRealMetrics(metrics)
+        captureWidth = metrics.widthPixels
+        captureHeight = metrics.heightPixels
+        val density = metrics.densityDpi
+
+        if (captureWidth <= 0 || captureHeight <= 0) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        imageReader = ImageReader.newInstance(
+            captureWidth, captureHeight, android.graphics.PixelFormat.RGBA_8888, 2
+        )
+
+        virtualDisplay = mediaProjection?.createVirtualDisplay(
+            "ScreenMirrorCapture",
+            captureWidth, captureHeight, density,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            imageReader?.surface, null, null
+        )
+
+        imageReader?.setOnImageAvailableListener({ reader ->
+            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            try {
+                drawFrame(image)
+            } finally {
+                image.close()
+            }
+        }, null)
+
+        return START_STICKY
+    }
+
+    private fun drawFrame(image: android.media.Image) {
+        val targetSurface = MirrorSurfaceHolder.surface ?: return
+        if (!targetSurface.isValid) return
+
+        val plane = image.planes[0]
+        val buffer = plane.buffer
+        val pixelStride = plane.pixelStride
+        val rowStride = plane.rowStride
+        val rowPadding = rowStride - pixelStride * captureWidth
+
+        val bitmapWidth = captureWidth + rowPadding / pixelStride
+        val fullBitmap = Bitmap.createBitmap(
+            bitmapWidth, captureHeight, Bitmap.Config.ARGB_8888
+        )
+        fullBitmap.copyPixelsFromBuffer(buffer)
+
+        val canvas = targetSurface.lockCanvas(null) ?: run {
+            fullBitmap.recycle()
+            return
+        }
+        try {
+            val destRect = Rect(0, 0, canvas.width, canvas.height)
+            val srcRect = Rect(0, 0, captureWidth, captureHeight)
+            canvas.drawBitmap(fullBitmap, srcRect, destRect, null)
+        } finally {
+            targetSurface.unlockCanvasAndPost(canvas)
+            fullBitmap.recycle()
+        }
+    }
+
+    private fun windowManager() =
+        getSystemService(WINDOW_SERVICE) as android.view.WindowManager
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID, "Screen Mirror", NotificationManager.IMPORTANCE_LOW
+            )
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun buildNotification(): Notification {
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Screen mirror running")
+            .setContentText("Mirroring shared app")
+            .setSmallIcon(android.R.drawable.ic_menu_view)
+            .build()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        virtualDisplay?.release()
+        imageReader?.close()
+        mediaProjection?.stop()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}
